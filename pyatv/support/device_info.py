@@ -121,7 +121,17 @@ def lookup_version(build: Optional[str]) -> Optional[str]:
     if match:
         base = int(match.groups()[0])
 
-        # 17A123 corresponds to tvOS 13.x, 16A123 to tvOS 12.x and so on
+        # 17A123 corresponds to tvOS 13.x, 16A123 to tvOS 12.x and so on.
+        # Formula: tvOS version = build_prefix - 4  (works for tvOS 13-18, prefix 17-22).
+        #
+        # Apple switched to year-based OS naming starting with tvOS 26 (2026), but
+        # build prefixes continued incrementing linearly (≈ 24 for tvOS 26.x).
+        # The old formula would wrongly return "20.x" for prefix 24, so we use a
+        # separate formula for the year-based era: tvOS version ≈ build_prefix + 2.
+        # Update _VERSION_LIST above with confirmed build strings as they become
+        # available, since that exact lookup always takes priority over this formula.
+        if base >= 24:
+            return str(base + 2) + ".x"
         return str(base - 4) + ".x"
 
     return None

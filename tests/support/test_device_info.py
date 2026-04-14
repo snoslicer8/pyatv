@@ -38,10 +38,13 @@ def test_lookup_internal_name(internal_name, expected_model):
     "version,expected_version",
     [
         (None, None),
-        ("17J586", "13.0"),
+        ("17J586", "13.0"),       # exact match in _VERSION_LIST
         ("bad_version", None),
-        ("16F123", "12.x"),
-        ("17F123", "13.x"),
+        ("16F123", "12.x"),       # formula, pre-tvOS 26 regime
+        ("17F123", "13.x"),       # formula, pre-tvOS 26 regime (regression)
+        ("22F123", "18.x"),       # formula, tvOS 18
+        ("24A123", "26.x"),       # formula, tvOS 26 year-based naming (build prefix 24)
+        ("25A123", "27.x"),       # formula, tvOS 27 year-based naming (build prefix 25)
     ],
 )
 def test_lookup_existing_version(version, expected_version):

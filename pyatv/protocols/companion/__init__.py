@@ -218,23 +218,32 @@ class CompanionPower(Power):
 
     async def initialize(self) -> None:
         """Initialize Power module."""
+        # Phase 1: best-effort initial state fetch; Unknown is acceptable if it fails
         try:
             system_status = await self.api.fetch_attention_state()
-
             self._power_state = CompanionPower._system_status_to_power_state(
                 system_status
             )
+            _LOGGER.debug("Initial power state is %s", self.power_state)
+        except Exception as ex:
+            _LOGGER.warning(
+                "Could not fetch initial attention state (%s); "
+                "power_state starts as Unknown but event updates will still work",
+                ex,
+            )
 
+        # Phase 2: subscribe to live events regardless of Phase 1 outcome
+        try:
             self.api.listen_to("SystemStatus", self._handle_system_status_update)
             await self.api.subscribe_event("SystemStatus")
 
             self.api.listen_to("TVSystemStatus", self._handle_system_status_update)
             await self.api.subscribe_event("TVSystemStatus")
-
-            _LOGGER.debug("Initial power state is %s", self.power_state)
         except Exception as ex:
-            _LOGGER.exception(
-                "Could not fetch SystemStatus, power_state will not work (%s)", ex
+            _LOGGER.error(
+                "Could not subscribe to system status events, "
+                "power state updates will not work: %s",
+                ex,
             )
 
     @property

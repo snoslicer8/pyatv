@@ -79,6 +79,9 @@ class CompanionServiceFlags(IntFlag):
     SYSTEM_STATUS_SUPPORTED = auto()
     """If system status is supported."""
 
+    SEND_SESSION_START_REQUEST = auto()
+    """Simulate tvOS 26+ behavior: send SessionStartRequest before accepting OPACK."""
+
 
 class FakeCompanionState:
     def __init__(self):
@@ -109,6 +112,7 @@ class FakeCompanionState:
         self.touch_event: HidEvent | None = None
         self.touch_width = 0
         self.touch_height = 0
+        self.session_handshake_done: bool = False
 
     def is_supported(self, flag: CompanionServiceFlags) -> bool:
         """Return if a feature is supported."""
@@ -225,6 +229,9 @@ class FakeCompanionServiceFactory:
 class FakeCompanionService(CompanionServerAuth, asyncio.Protocol):
     """Implementation of a fake Companion Apple TV."""
 
+    # 4-byte nonce used for the SessionStartRequest/Response handshake
+    _SESSION_NONCE = b"\xde\xad\xbe\xef"
+
     def __init__(self, state):
         super().__init__(DEVICE_NAME)
         self.loop = asyncio.get_event_loop()
@@ -233,11 +240,21 @@ class FakeCompanionService(CompanionServerAuth, asyncio.Protocol):
         self.chacha = None
         self.transport = None
         self._pressed_buttons: Set[HidCommand] = set()
+        self._awaiting_session_response: bool = False
 
     def connection_made(self, transport):
         _LOGGER.debug("Client connected")
         self.transport = transport
         self.state.clients.append(self)
+
+        if self.state.is_supported(CompanionServiceFlags.SEND_SESSION_START_REQUEST):
+            _LOGGER.debug("Sending SessionStartRequest (tvOS 26 simulation)")
+            self._awaiting_session_response = True
+            nonce = self._SESSION_NONCE
+            header = bytes([FrameType.SessionStartRequest.value]) + len(nonce).to_bytes(
+                3, byteorder="big"
+            )
+            self.transport.write(header + nonce)
 
     def connection_lost(self, exc):
         _LOGGER.debug("Client disconnected")
@@ -282,24 +299,38 @@ class FakeCompanionService(CompanionServerAuth, asyncio.Protocol):
             data = self.buffer[4:payload_length]
             self.buffer = self.buffer[payload_length:]
 
-            if self.chacha:
+            if self.chacha and frame_type not in (
+                FrameType.SessionStartResponse,
+            ):
                 data = self.chacha.decrypt(data, aad=header)
 
-            unpacked, _ = opack.unpack(data)
-
             try:
-                if frame_type in COMPANION_AUTH_FRAMES:
-                    self.handle_auth_frame(frame_type, unpacked)
-                else:
-                    if not self.chacha:
-                        raise Exception("client has not authenticated")
-
-                    _LOGGER.debug("Received OPACK: %s", unpacked)
-                    handler_method_name = f"handle_{unpacked['_i'].lower()}"
-                    if hasattr(self, handler_method_name):
-                        getattr(self, handler_method_name)(unpacked)
+                if frame_type == FrameType.SessionStartResponse:
+                    # Raw binary frame — not OPACK-encoded
+                    if self._awaiting_session_response and data == self._SESSION_NONCE:
+                        _LOGGER.debug("Received valid SessionStartResponse")
+                        self._awaiting_session_response = False
+                        self.state.session_handshake_done = True
                     else:
-                        self.send_handler_not_supported(unpacked)
+                        _LOGGER.warning(
+                            "Unexpected SessionStartResponse: %s (expected %s)",
+                            data,
+                            self._SESSION_NONCE,
+                        )
+                else:
+                    unpacked, _ = opack.unpack(data)
+                    if frame_type in COMPANION_AUTH_FRAMES:
+                        self.handle_auth_frame(frame_type, unpacked)
+                    else:
+                        if not self.chacha:
+                            raise Exception("client has not authenticated")
+
+                        _LOGGER.debug("Received OPACK: %s", unpacked)
+                        handler_method_name = f"handle_{unpacked['_i'].lower()}"
+                        if hasattr(self, handler_method_name):
+                            getattr(self, handler_method_name)(unpacked)
+                        else:
+                            self.send_handler_not_supported(unpacked)
 
             except Exception:
                 _LOGGER.exception("failed to handle incoming data")

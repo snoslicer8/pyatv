@@ -150,6 +150,13 @@ class CompanionAPI(
         self._protocol.listener = self
         await self._protocol.start()
 
+        # tvOS 26+ sends SessionStartRequest immediately after the connection is
+        # established. Wait until the handshake is complete (or until we time out,
+        # for older devices that never send it and leave the event pre-set).
+        await asyncio.wait_for(
+            self._protocol.session_ready_event.wait(), timeout=3.0
+        )
+
         await self.system_info()
         await self._touch_start()
         await self._session_start()

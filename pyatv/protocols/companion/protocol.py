@@ -1,5 +1,6 @@
 """Implementation of the Companion protocol."""
 
+import asyncio
 from abc import ABC
 from enum import Enum
 import logging
@@ -16,7 +17,7 @@ from pyatv.protocols.companion.connection import (
     CompanionConnectionListener,
     FrameType,
 )
-from pyatv.support import error_handler, opack
+from pyatv.support import error_handler, log_binary, opack
 from pyatv.support.collections import SharedData
 from pyatv.support.state_producer import StateProducer
 
@@ -90,6 +91,10 @@ class CompanionProtocol(
         self._queues: Dict[FrameIdType, SharedData[Any]] = {}
         self._chacha = None
         self._is_started = False
+        # Pre-set so devices that never send SessionStartRequest are unaffected.
+        # Cleared transiently while a SessionStartRequest is being answered.
+        self._session_ready: asyncio.Event = asyncio.Event()
+        self._session_ready.set()
 
     async def start(self):
         """Connect to device and listen to incoming messages."""
@@ -105,6 +110,11 @@ class CompanionProtocol(
         _LOGGER.debug("Companion credentials: %s", self.service.credentials)
 
         await error_handler(self._setup_encryption, exceptions.AuthenticationError)
+
+    @property
+    def session_ready_event(self) -> asyncio.Event:
+        """Event that is set when no pending SessionStartRequest handshake is in progress."""
+        return self._session_ready
 
     def stop(self):
         """Disconnect from device."""
@@ -162,8 +172,13 @@ class CompanionProtocol(
         _LOGGER.debug("Exchange OPACK: %s", data)
 
         self.send_opack(frame_type, data)
-        self._queues[identifier] = SharedData()
-        unpacked_object = await self._queues[identifier].wait(timeout)
+        shared_data: SharedData[Any] = SharedData()
+        self._queues[identifier] = shared_data
+        try:
+            unpacked_object = await shared_data.wait(timeout)
+        except asyncio.TimeoutError:
+            self._queues.pop(identifier, None)
+            raise
 
         if not isinstance(unpacked_object, dict):
             raise exceptions.ProtocolError(
@@ -203,8 +218,15 @@ class CompanionProtocol(
                     self._handle_opack(frame_type, opack_data)
             except Exception:
                 _LOGGER.exception("failed to process frame")
+        elif frame_type == FrameType.SessionStartRequest:
+            self._handle_session_start_request(data)
         else:
-            _LOGGER.debug("Received unsupported frame type: %s", frame_type)
+            _LOGGER.warning(
+                "Received unhandled frame type %s (%d bytes); ignoring",
+                frame_type,
+                len(data),
+            )
+            log_binary(_LOGGER, "Unhandled frame payload", Data=data)
 
     def _handle_auth(self, frame_type: FrameType, opack_data: Dict[str, Any]) -> None:
         _LOGGER.debug("Process incoming auth frame (%s): %s", frame_type, opack_data)
@@ -232,3 +254,27 @@ class CompanionProtocol(
                 _LOGGER.debug("No receiver for XID %s", xid)
         else:
             _LOGGER.warning("Got OPACK frame with unsupported type: %s", message_type)
+
+    def _handle_session_start_request(self, data: bytes) -> None:
+        """Handle SessionStartRequest sent by tvOS 26+ before it accepts OPACK commands.
+
+        tvOS 26.5 sends this frame (0x10) immediately after the Companion connection is
+        established, expecting a SessionStartResponse (0x11) before it will process any
+        OPACK commands including FetchAttentionState.
+
+        The exact payload format is not yet fully documented; echoing the received bytes
+        is consistent with how other Apple protocol clients handle unknown challenge frames
+        and is safe as a starting point until packet captures confirm the full format.
+        """
+        _LOGGER.debug("Received SessionStartRequest (%d bytes)", len(data))
+        log_binary(_LOGGER, "SessionStartRequest payload", Data=data)
+
+        # Signal that we are mid-handshake so that any concurrent exchange_opack calls
+        # will wait until after we have sent the response.
+        self._session_ready.clear()
+        try:
+            self.connection.send(FrameType.SessionStartResponse, data)
+        finally:
+            self._session_ready.set()
+
+        _LOGGER.debug("Sent SessionStartResponse")

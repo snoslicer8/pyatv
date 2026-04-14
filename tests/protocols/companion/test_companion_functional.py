@@ -412,3 +412,66 @@ async def test_touch_click(companion_client, companion_state):
 async def test_touch_hold(companion_client, companion_state):
     await companion_client.touch.click(InputAction.Hold)
     assert companion_state.latest_button == "select"
+
+
+# --- SessionStartRequest handshake (tvOS 26+) ---
+
+
+async def test_session_start_handshake(companion_conf, companion_state):
+    """Connect succeeds and session is established when device sends SessionStartRequest."""
+    companion_state.set_flag_state(
+        CompanionServiceFlags.SEND_SESSION_START_REQUEST, True
+    )
+
+    atv = await pyatv.connect(companion_conf, loop=asyncio.get_running_loop())
+
+    # The session start handshake should have completed
+    await until(lambda: companion_state.session_handshake_done)
+    # The OPACK session should also have been established (sid is set)
+    await until(lambda: companion_state.sid != 0)
+
+    await asyncio.gather(*atv.close())
+
+
+async def test_session_start_handshake_power_state_works(companion_conf, companion_state):
+    """Power state is correctly reported when a SessionStartRequest handshake is required."""
+    companion_state.set_flag_state(
+        CompanionServiceFlags.SEND_SESSION_START_REQUEST, True
+    )
+
+    atv = await pyatv.connect(companion_conf, loop=asyncio.get_running_loop())
+
+    # Fake device default is Awake → PowerState.On
+    await until(lambda: atv.power.power_state == PowerState.On)
+
+    await asyncio.gather(*atv.close())
+
+
+# --- Power state event subscriptions survive FetchAttentionState failure ---
+
+
+async def test_power_state_events_work_when_initial_fetch_fails(
+    companion_conf, companion_state
+):
+    """Event subscriptions fire even when FetchAttentionState returns unsupported."""
+    # Disable system status so FetchAttentionState returns error
+    companion_state.set_flag_state(
+        CompanionServiceFlags.SYSTEM_STATUS_SUPPORTED, False
+    )
+
+    atv = await pyatv.connect(companion_conf, loop=asyncio.get_running_loop())
+
+    # Power state starts Unknown because initial fetch failed
+    assert atv.power.power_state == PowerState.Unknown
+
+    # Re-enable and trigger an event update
+    companion_state.set_flag_state(
+        CompanionServiceFlags.SYSTEM_STATUS_SUPPORTED, True
+    )
+    # Setting system_status triggers SystemStatus event to all connected clients
+    companion_state.system_status = companion_state.system_status
+
+    # Power state should update from the event even though initial fetch failed
+    await until(lambda: atv.power.power_state == PowerState.On)
+
+    await asyncio.gather(*atv.close())
